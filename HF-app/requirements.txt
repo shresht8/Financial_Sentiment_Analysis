@@ -1,0 +1,6 @@
+transformers
+openpyxl
+torch
+pandas
+gradio
+plotly
