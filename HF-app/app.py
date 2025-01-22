@@ -5,6 +5,12 @@ from transformers import AutoTokenizer, AutoModelForSequenceClassification
 import plotly.express as px
 import plotly.graph_objects as go
 from collections import defaultdict
+from openai import OpenAI
+from pydantic import BaseModel, Field, field_validator, ValidationInfo
+from typing import Optional, Dict, Any, List, Annotated
+from instructor import patch
+import instructor
+from prompts import sentiments_prompt
 
 # Load model and tokenizer globally for efficiency
 model_name = "tabularisai/multilingual-sentiment-analysis"
@@ -20,6 +26,22 @@ SENTIMENT_WEIGHTS = {
     4: 1.0  # Very Positive
 }
 
+class ExtractProductSentiment(BaseModel):
+    """Extracts what people like and dislike about a product based on product reviews and sentiment scores (0-100)"""
+    product_likes: List[str] = Field(..., description="What people like about the product. List of 3 sentences AT MOST. Must be aggregated in the order of importance.")
+    product_dislikes: List[str] = Field(..., description="What people dislike about the product. List of 3 sentences AT MOST. Must be aggregated in the order of importance.")
+
+    @field_validator("product_likes", "product_dislikes")
+    def validate_product_likes_and_dislikes(cls, v, info: ValidationInfo):
+        if not v:
+            raise ValueError(f"At least one {info.field_name} must be provided. If nothing to say, please enter 'None'")
+        
+        if len(v) > 3:
+            raise ValueError(
+                f"{info.field_name} contains {len(v)} points. Please aggregate the points to a maximum of 3 key points "
+                "in order of importance. Combine similar points together."
+            )
+        return v
 
 def predict_sentiment_with_scores(texts):
     """
@@ -51,8 +73,104 @@ def predict_sentiment_with_scores(texts):
 
     return predicted_classes, sentiment_scores
 
+#patch()  # Patch OpenAI client to support response models
 
-def process_single_sheet(df, product_name):
+def get_product_sentiment(client, reviews: List[str], scores: List[float]) -> ExtractProductSentiment:
+    """Extract product likes and dislikes using OpenAI"""
+    # Combine reviews and scores for context
+    review_context = "\n".join([f"Review (Score: {score}): {review}" 
+                               for review, score in zip(reviews, scores)])
+    #client = instructor.patch(OpenAI(api_key=openai_api_key))
+    prompt = sentiments_prompt.format(review_context=review_context)
+
+    response = client.chat.completions.create(
+        model="gpt-4o",
+        response_model=ExtractProductSentiment,
+        messages=[
+            {"role": "system", "content": "You are a helpful product analyst."},
+            {"role": "user", "content": prompt}
+        ],
+        max_retries=3
+    )
+    return response
+
+def create_comparison_charts(sentiment_results, avg_sentiment_scores):
+    """
+    Create comparison charts for sentiment analysis across products
+    """
+    # Create summary DataFrame
+    summary_data = []
+    for product in sentiment_results.keys():
+        counts = sentiment_results[product]
+        total = counts.sum()
+        row = {
+            'Product': product,
+            'Average Sentiment Score': avg_sentiment_scores[product],
+            'Total Reviews': total,
+            'Very Positive %': round((counts.get('Very Positive', 0) / total) * 100, 2),
+            'Positive %': round((counts.get('Positive', 0) / total) * 100, 2),
+            'Neutral %': round((counts.get('Neutral', 0) / total) * 100, 2),
+            'Negative %': round((counts.get('Negative', 0) / total) * 100, 2),
+            'Very Negative %': round((counts.get('Very Negative', 0) / total) * 100, 2)
+        }
+        summary_data.append(row)
+    
+    summary_df = pd.DataFrame(summary_data)
+
+    # Score comparison chart
+    score_comparison_fig = px.bar(
+        summary_df,
+        x='Product',
+        y='Average Sentiment Score',
+        title='Average Sentiment Scores by Product',
+        labels={'Average Sentiment Score': 'Score (0-100)'}
+    )
+
+    # Distribution chart
+    distribution_data = []
+    for product in sentiment_results.keys():
+        counts = sentiment_results[product]
+        # Aggregate positive and negative sentiments
+        aggregated_counts = {
+            'Positive': counts.get('Very Positive', 0) + counts.get('Positive', 0),
+            'Neutral': counts.get('Neutral', 0),
+            'Negative': counts.get('Very Negative', 0) + counts.get('Negative', 0)
+        }
+        for sentiment, count in aggregated_counts.items():
+            distribution_data.append({
+                'Product': product,
+                'Sentiment': sentiment,
+                'Count': count
+            })
+    
+    distribution_df = pd.DataFrame(distribution_data)
+    distribution_fig = px.bar(
+        distribution_df,
+        x='Product',
+        y='Count',
+        color='Sentiment',
+        title='Sentiment Distribution by Product',
+        barmode='group',
+        color_discrete_map={
+            'Positive': '#2ECC71',  # Green
+            'Neutral': '#F1C40F',   # Yellow
+            'Negative': '#E74C3C'   # Red
+        }
+    )
+
+    # Ratio chart (percentage stacked bar)
+    ratio_fig = px.bar(
+        distribution_df,
+        x='Product',
+        y='Count',
+        color='Sentiment',
+        title='Sentiment Distribution Ratio by Product',
+        barmode='relative'
+    )
+
+    return score_comparison_fig, distribution_fig, ratio_fig, summary_df
+
+def process_single_sheet(df, product_name, openai_client):
     """
     Process a single dataframe and return sentiment analysis results
     """
@@ -65,183 +183,44 @@ def process_single_sheet(df, product_name):
     df['Sentiment'] = sentiments
     df['Sentiment_Score'] = scores
 
+    # Extract product likes and dislikes
+    try:
+        product_sentiment = get_product_sentiment(openai_client, reviews.tolist(), scores)
+        
+        # Initialize empty columns
+        df['Likes'] = ""
+        df['Dislikes'] = ""
+        
+        # Get the likes and dislikes lists
+        likes_list = product_sentiment.product_likes
+        dislikes_list = product_sentiment.product_dislikes
+        
+        # Only populate the first N rows where N is the length of the likes/dislikes lists
+        for idx, (like, dislike) in enumerate(zip(likes_list, dislikes_list)):
+            df.loc[idx, 'Likes'] = like
+            df.loc[idx, 'Dislikes'] = dislike
+            
+    except Exception as e:
+        print(f"Error extracting likes/dislikes for {product_name}: {str(e)}")
+        df['Likes'] = ""
+        df['Dislikes'] = ""
+
     # Calculate sentiment distribution
     sentiment_counts = pd.Series(sentiments).value_counts()
     avg_sentiment_score = round(sum(scores) / len(scores), 2)
 
     return df, sentiment_counts, avg_sentiment_score
 
-
-def create_comparison_charts(sentiment_results, avg_scores):
-    """
-    Create investment-focused comparison charts including the new sentiment score visualization
-    """
-    # Prepare data for plotting
-    plot_data = []
-    for product, sentiment_counts in sentiment_results.items():
-        sentiment_dict = sentiment_counts.to_dict()
-        total = sum(sentiment_dict.values())
-
-        row = {
-            'Product': product,
-            'Total Reviews': total
-        }
-        # Calculate percentages for each sentiment
-        for sentiment, count in sentiment_dict.items():
-            row[sentiment] = (count / total) * 100
-        plot_data.append(row)
-
-    df = pd.DataFrame(plot_data)
-
-    # Ensure all sentiment columns exist in the correct order
-    sentiments = ['Very Positive', 'Positive', 'Neutral', 'Negative', 'Very Negative']
-    for sentiment in sentiments:
-        if sentiment not in df.columns:
-            df[sentiment] = 0
-
-    # Calculate weighted sentiment score (0 to 100)
-    sentiment_weights = {
-        'Very Negative': 0,
-        'Negative': 25,
-        'Neutral': 50,
-        'Positive': 75,
-        'Very Positive': 100
-    }
-
-    # Create stacked bar chart for sentiment distribution
-    distribution_fig = go.Figure()
-    sentiments = ['Very Positive', 'Positive', 'Neutral', 'Negative', 'Very Negative']
-    colors = ['rgb(39, 174, 96)', 'rgb(46, 204, 113)',
-              'rgb(241, 196, 15)', 'rgb(231, 76, 60)',
-              'rgb(192, 57, 43)']
-
-    for sentiment, color in zip(sentiments, colors):
-        distribution_fig.add_trace(go.Bar(
-            name=sentiment,
-            x=df['Product'],
-            y=df[sentiment],
-            marker_color=color
-        ))
-
-    distribution_fig.update_layout(
-        barmode='stack',
-        title='Sentiment Distribution by Product',
-        yaxis_title='Percentage (%)',
-        showlegend=True
-    )
-
-    # Calculate Positive-Negative Ratios
-    df['Positive Ratio'] = df[['Positive', 'Very Positive']].sum(axis=1)
-    df['Negative Ratio'] = df[['Negative', 'Very Negative']].sum(axis=1)
-
-    # Create Positive-Negative ratio chart
-    ratio_fig = go.Figure()
-    ratio_fig.add_trace(go.Bar(
-        name='Positive',
-        x=df['Product'],
-        y=df['Positive Ratio'],
-        marker_color='rgb(50, 205, 50)'
-    ))
-    ratio_fig.add_trace(go.Bar(
-        name='Negative',
-        x=df['Product'],
-        y=df['Negative Ratio'],
-        marker_color='rgb(220, 20, 60)'
-    ))
-    ratio_fig.update_layout(
-        barmode='group',
-        title='Positive vs Negative Sentiment Ratio by Product',
-        yaxis_title='Percentage (%)'
-    )
-
-    # Create summary DataFrame
-    summary_data = {
-        'Product': df['Product'].tolist(),
-        'Total Reviews': df['Total Reviews'].tolist(),
-        'Positive Ratio (%)': df['Positive Ratio'].round(2).tolist(),
-        'Negative Ratio (%)': df['Negative Ratio'].round(2).tolist(),
-        'Neutral Ratio (%)': df['Neutral'].round(2).tolist(),
-        'Weighted Sentiment Score': [avg_scores[prod] for prod in df['Product']]
-    }
-    summary_df = pd.DataFrame(summary_data)
-
-    # Create sentiment score chart
-    score_comparison_fig = go.Figure()
-    score_comparison_fig.add_trace(go.Bar(
-        x=summary_df['Product'],
-        y=summary_df['Weighted Sentiment Score'],
-        text=[f"{score:.1f}" for score in summary_df['Weighted Sentiment Score']],
-        textposition='auto',
-        marker_color='rgb(65, 105, 225)',
-        name='Sentiment Score'
-    ))
-    score_comparison_fig.update_layout(
-        title='Weighted Sentiment Scores by Product (0-100)',
-        yaxis_title='Sentiment Score',
-        yaxis_range=[0, 100],
-        showlegend=False,
-        bargap=0.3,
-        plot_bgcolor='white'
-    )
-
-    return score_comparison_fig, distribution_fig, ratio_fig, summary_df
-
-    products = list(avg_scores.keys())
-    scores = list(avg_scores.values())
-
-    # Add bars for sentiment scores
-    score_comparison_fig.add_trace(go.Bar(
-        x=products,
-        y=scores,
-        text=[f"{score:.1f}" for score in scores],
-        textposition='auto',
-        marker_color='rgb(65, 105, 225)',
-        name='Sentiment Score'
-    ))
-
-    # Update layout with appropriate styling
-    score_comparison_fig.update_layout(
-        title='Weighted Sentiment Scores by Product (0-100)',
-        yaxis_title='Sentiment Score',
-        yaxis_range=[0, 100],
-        showlegend=False,
-        bargap=0.3,
-        plot_bgcolor='white'
-    )
-
-    # Add score to summary DataFrame
-    summary_df['Weighted Sentiment Score'] = [avg_scores[prod] for prod in summary_df['Product']]
-
-    # Create sentiment distribution stacked bar chart
-    distribution_fig = go.Figure()
-    colors = ['rgb(39, 174, 96)', 'rgb(46, 204, 113)',
-              'rgb(241, 196, 15)', 'rgb(231, 76, 60)',
-              'rgb(192, 57, 43)']
-
-    # Add traces for each sentiment in order
-    for sentiment, color in zip(sentiments, colors):
-        distribution_fig.add_trace(go.Bar(
-            name=sentiment,
-            x=df['Product'],
-            y=df[sentiment],
-            marker_color=color
-        ))
-
-    distribution_fig.update_layout(
-        barmode='stack',
-        title='Sentiment Distribution by Product',
-        yaxis_title='Percentage (%)',
-        showlegend=True
-    )
-
-    return score_comparison_fig, distribution_fig, summary_df, output_path
-
-
-def process_file(file_obj):
+def process_file(file_obj, api_key):
     """
     Process the input file and add sentiment analysis results
     """
     try:
+        if not api_key:
+            raise ValueError("OpenAI API key is required")
+            
+        client = instructor.patch(OpenAI(api_key=api_key))
+        
         file_path = file_obj.name
         sentiment_results = defaultdict(pd.Series)
         avg_sentiment_scores = {}
@@ -250,7 +229,7 @@ def process_file(file_obj):
         if file_path.endswith('.csv'):
             df = pd.read_csv(file_path)
             product_name = "Product"  # Default name for CSV
-            processed_df, sentiment_counts, avg_score = process_single_sheet(df, product_name)
+            processed_df, sentiment_counts, avg_score = process_single_sheet(df, product_name, client)
             all_processed_dfs[product_name] = processed_df
             sentiment_results[product_name] = sentiment_counts
             avg_sentiment_scores[product_name] = avg_score
@@ -259,7 +238,7 @@ def process_file(file_obj):
             excel_file = pd.ExcelFile(file_path)
             for sheet_name in excel_file.sheet_names:
                 df = pd.read_excel(file_path, sheet_name=sheet_name)
-                processed_df, sentiment_counts, avg_score = process_single_sheet(df, sheet_name)
+                processed_df, sentiment_counts, avg_score = process_single_sheet(df, sheet_name, client)
                 all_processed_dfs[sheet_name] = processed_df
                 sentiment_results[sheet_name] = sentiment_counts
                 avg_sentiment_scores[sheet_name] = avg_score
@@ -277,17 +256,6 @@ def process_file(file_obj):
             for sheet_name, df in all_processed_dfs.items():
                 df.to_excel(writer, sheet_name=sheet_name, index=False)
             if isinstance(summary_df, pd.DataFrame):  # Safety check
-                summary_df.to_excel(writer, sheet_name='Summary', index=False)
-
-        # Save results
-        output_path = "sentiment_analysis_results.xlsx"
-        with pd.ExcelWriter(output_path) as writer:
-            # Save individual sheet data
-            for sheet_name, df in all_processed_dfs.items():
-                df.to_excel(writer, sheet_name=sheet_name, index=False)
-
-            # Save summary data
-            if isinstance(summary_df, pd.DataFrame):  # Ensure it's a DataFrame before saving
                 summary_df.to_excel(writer, sheet_name='Summary', index=False)
 
         return score_comparison_fig, distribution_fig, summary_df, output_path
@@ -314,6 +282,13 @@ with gr.Blocks() as interface:
     """)
 
     with gr.Row():
+        api_key_input = gr.Textbox(
+            label="OpenAI API Key",
+            placeholder="Enter your OpenAI API key",
+            type="password"
+        )
+
+    with gr.Row():
         file_input = gr.File(
             label="Upload File (CSV or Excel)",
             file_types=[".csv", ".xlsx", ".xls"]
@@ -336,7 +311,7 @@ with gr.Blocks() as interface:
 
     analyze_btn.click(
         fn=process_file,
-        inputs=[file_input],
+        inputs=[file_input, api_key_input],
         outputs=[sentiment_score_plot, distribution_plot, summary_table, output_file]
     )
 

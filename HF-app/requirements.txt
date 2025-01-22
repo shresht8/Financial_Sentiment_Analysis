@@ -4,3 +4,4 @@ torch
 pandas
 gradio
 plotly
+openai
